@@ -42,12 +42,12 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 # Data Models
 class Nutrition(BaseModel):
     fat_g: float
-    saturated_fat_g: Optional[float] = 0
-    trans_fat_g: Optional[float] = 0
-    cholesterol_mg: Optional[float] = 0
+    saturated_fat_g: Optional[float]
+    trans_fat_g: Optional[float]
+    cholesterol_mg: Optional[float]
     sodium_mg: float
     carbohydrates_g: float
-    fiber_g: Optional[float] = 0
+    fiber_g: Optional[float]
     sugar_g: float
     protein_g: float
 
