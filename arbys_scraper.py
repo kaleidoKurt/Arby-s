@@ -198,12 +198,13 @@ async def extract_item_details_batch(items: List[MenuItemBasic], full_source_tex
     3. **Nutrition**: Extract calories, fat, sodium, carbs, sugar, protein. Use 0 for "< 1g".
     4. **Allergens**: Extract explicitly listed allergens.
     5. **Categorization**: Keep the original category if possible.
+    6. **Hallucination**: Only extract items actually found in the SOURCE TEXT. If an item is missing, skip it.
     
     GLOSSARY:
     {glossary_json}
     
     SOURCE TEXT CONTEXT (excerpts):
-    {full_source_text[:15000]}
+    {full_source_text[:20000]}
     """
     
     try:
@@ -223,7 +224,7 @@ ALLOWED_KINDS = {
 }
 
 _RX_KIDS = re.compile(r"\bkids?\b", re.I)
-_RX_CONDIMENT = re.compile(r"\b(condiment|sauce|dipping|dip|spread|dressing|syrup)\b", re.I)
+_RX_CONDIMENT = re.compile(r"\b(condiment|sauce|dipping|dip|spread|dressing|syrup|ketchup|mayo|mustard|packet|pepper|packet)\b", re.I)
 
 _RX_DRINK = re.compile(
     r"\b("
@@ -301,7 +302,26 @@ MIN_INGREDIENTS_CHARS = 10
 def hallucination_check(display_name: str, source_text: str) -> bool:
     clean_name = re.sub(r"[^a-zA-Z0-9\s]", "", display_name).lower()
     clean_source = re.sub(r"[^a-zA-Z0-9\s]", "", source_text).lower()
-    return clean_name in clean_source
+    
+    # Direct match first (handles most cases)
+    if clean_name in clean_source:
+        return True
+        
+    # Word set overlap approach (V3.5 flex)
+    # Check if at least 70% of words in the display name appear in the source text
+    name_words = [w for w in clean_name.split() if len(w) > 1]
+    if not name_words:
+        return False
+        
+    source_words = set(clean_source.split())
+    matches = [w for w in name_words if w in source_words]
+    
+    overlap = len(matches) / len(name_words)
+    if overlap >= 0.7:
+        print(f"  -> Flex match found: {overlap:.1%} overlap for '{display_name}'")
+        return True
+        
+    return False
 
 async def get_current_item_count() -> int:
     try:
@@ -349,7 +369,11 @@ async def ingest_item(item: MenuItem, source_text: str) -> bool:
             return False
             
         supabase.table("item_ingredients").delete().eq("menu_item_id", menu_item_id).execute()
-        ingredients_payload = [{"menu_item_id": menu_item_id, "ingredient": ing} for ing in item.ingredients_raw]
+        
+        # Deduplicate ingredients to prevent unique constraint violations (SQL Error 23505)
+        unique_ingredients = list(dict.fromkeys(item.ingredients_raw))
+        ingredients_payload = [{"menu_item_id": menu_item_id, "ingredient": ing} for ing in unique_ingredients]
+        
         if ingredients_payload:
             supabase.table("item_ingredients").insert(ingredients_payload).execute()
         
@@ -379,8 +403,22 @@ async def main():
         for i in range(0, len(basic_items), batch_size):
             batch = basic_items[i:i + batch_size]
             detailed_items = await extract_item_details_batch(batch, full_source_text, glossary)
+            
+            # Fallback: If batch fails (e.g. JSON truncation), retry items individually
+            if not detailed_items:
+                print(f"Batch {i//batch_size + 1} failed. Retrying items individually...")
+                for single_item in batch:
+                    retry_item = await extract_item_details_batch([single_item], full_source_text, glossary)
+                    if retry_item:
+                        await ingest_item(retry_item[0], full_source_text)
+                    else:
+                        print(f"  -> CRITICAL: Failed to extract {single_item.display_name} even on retry.")
+                        INGEST_STATS["failed"] += 1
+                continue
+
             for item in detailed_items:
                 await ingest_item(item, full_source_text)
+            
             if i + batch_size < len(basic_items):
                 await asyncio.sleep(1)
 
