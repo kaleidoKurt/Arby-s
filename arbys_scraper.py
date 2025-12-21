@@ -22,6 +22,17 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 RESTAURANT_NAME = "Arby's"
 RESTAURANT_ID = "40a157f4-a98b-4de1-aad3-3a6d4bd7e1b5"
+MIN_ITEMS_THRESHOLD = 50 # Fail if we don't get at least this many items
+
+# Global Stats
+INGEST_STATS = {
+    "total_extracted": 0,
+    "success": 0,
+    "failed": 0,
+    "rejected_hallucination": 0,
+    "rejected_quality": 0,
+    "rejected_nutrition": 0
+}
 
 # Deterministic ID Namespace (using Restaurant ID)
 NAMESPACE_UUID = uuid.UUID(RESTAURANT_ID)
@@ -311,7 +322,7 @@ async def get_current_item_count() -> int:
     except Exception:
         return 0
 
-async def ingest_item(item: MenuItem, source_text: str):
+async def ingest_item(item: MenuItem, source_text: str) -> bool:
     category, kind = normalize_category_fields(
         display_name=item.display_name,
         raw_category=item.category
@@ -322,18 +333,21 @@ async def ingest_item(item: MenuItem, source_text: str):
     # 1. Hallucination Gate
     if not hallucination_check(item.display_name, source_text):
         print(f"  -> REJECTED: Hallucination detected - '{item.display_name}' not in source text.")
-        return
+        INGEST_STATS["rejected_hallucination"] += 1
+        return False
 
     # 2. Ingredient Quality Gate
     total_ing_chars = sum(len(ing) for ing in item.ingredients_raw)
     if total_ing_chars < MIN_INGREDIENTS_CHARS:
         print(f"  -> REJECTED: Insufficient ingredients ({total_ing_chars} chars).")
-        return
+        INGEST_STATS["rejected_quality"] += 1
+        return False
 
     # 3. Nutrition Gate
     if item.calories <= 0 and "water" not in item.display_name.lower() and "diet" not in item.display_name.lower():
         print(f"  -> REJECTED: Invalid calories ({item.calories})")
-        return
+        INGEST_STATS["rejected_nutrition"] += 1
+        return False
 
     try:
         # Upsert Menu Item
@@ -352,7 +366,8 @@ async def ingest_item(item: MenuItem, source_text: str):
         
         if not res.data:
             print(f"  -> Failed to upsert menu item: {item.display_name}")
-            return
+            INGEST_STATS["failed"] += 1
+            return False
             
         # Update Ingredients
         supabase.table("item_ingredients").delete().eq("menu_item_id", menu_item_id).execute()
@@ -364,9 +379,17 @@ async def ingest_item(item: MenuItem, source_text: str):
         if ingredients_payload:
             supabase.table("item_ingredients").insert(ingredients_payload).execute()
             print(f"  -> SUCCESS: {len(ingredients_payload)} ingredients saved.")
+            INGEST_STATS["success"] += 1
+            return True
+        else:
+            print(f"  -> Warning: No ingredients to save for {item.display_name}")
+            INGEST_STATS["success"] += 1 # Item saved, just no ingredients
+            return True
             
     except Exception as e:
         print(f"  -> Error ingesting {item.display_name}: {e}")
+        INGEST_STATS["failed"] += 1
+        raise e # Re-raise to trigger fail-fast in main()
 
 async def main():
     try:
@@ -398,8 +421,10 @@ async def main():
         
         # 5. Ingest into Supabase
         if not items:
-            print("No items extracted. Aborting ingestion.")
-            return
+            print("CRITICAL: No items extracted from Gemini. ABORTING.")
+            sys.exit(1)
+
+        INGEST_STATS["total_extracted"] = len(items)
 
         # Count Sanity Check (V3.5 Standard)
         current_count = await get_current_item_count()
@@ -413,6 +438,16 @@ async def main():
         full_source_text = menu_layout_text + "\n" + nutrition_text
         for item in items:
             await ingest_item(item, full_source_text)
+
+        # Final Success Check
+        print("\n--- Scrape Summary ---")
+        print(json.dumps(INGEST_STATS, indent=2))
+        
+        if INGEST_STATS["success"] < MIN_ITEMS_THRESHOLD:
+            print(f"CRITICAL: Successful ingestions ({INGEST_STATS['success']}) below threshold ({MIN_ITEMS_THRESHOLD}). FAIL.")
+            sys.exit(1)
+            
+        print(f"\nSUCCESS: Arby's scraper completed with {INGEST_STATS['success']} items saved.")
             
     except Exception as e:
         print(f"CRITICAL ERROR in main execution: {e}")
