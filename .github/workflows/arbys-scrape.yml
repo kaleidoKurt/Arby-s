@@ -26,6 +26,7 @@ jobs:
 
       - name: Run Arby's scraper
         run: |
+          set -o pipefail
           python arbys_scraper.py 2>&1 | tee arbys-scrape.log
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

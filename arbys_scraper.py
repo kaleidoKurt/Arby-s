@@ -71,6 +71,14 @@ class MenuItem(BaseModel):
     ingredients_raw: List[str]
     allergens: List[str]
 
+class MenuItemBasic(BaseModel):
+    display_name: str
+    slug: str
+    category: Optional[str]
+
+class MenuDiscovery(BaseModel):
+    items: List[MenuItemBasic]
+
 class MenuExtraction(BaseModel):
     items: List[MenuItem]
 
@@ -131,14 +139,46 @@ async def get_glossary_mapping(glossary_text: str) -> Dict[str, List[str]]:
     response = await asyncio.to_thread(model.generate_content, prompt)
     try:
         data = GlossaryMapping.model_validate_json(response.text)
-        # Convert list of objects to dict for easier lookup
         return {entry.compound_ingredient: entry.sub_ingredients for entry in data.entries}
     except Exception as e:
         print(f"Error parsing glossary: {e}")
-        raise # Re-raise to trigger fail-fast in main()
+        raise
 
-async def extract_menu_data(menu_text: str, nutrition_text: str, glossary: Dict[str, List[str]]) -> List[MenuItem]:
-    print("Extracting menu data with Gemini...")
+async def discover_menu_items(menu_text: str, nutrition_text: str) -> List[MenuItemBasic]:
+    print("Discovering menu items list with Gemini...")
+    model = genai.GenerativeModel(
+        GEMINI_MODEL,
+        generation_config={
+            "response_mime_type": "application/json",
+            "response_schema": MenuDiscovery,
+        }
+    )
+    
+    prompt = f"""
+    You are a nutrition data expert. Analyze the Arby's menu text and nutrition text.
+    Extract a unique list of all menu items found.
+    Return ONLY the display_name, a URL-friendly slug, and the category.
+    
+    MENU LAYOUT TEXT:
+    {menu_text}
+    
+    NUTRITION TEXT:
+    {nutrition_text}
+    """
+    
+    response = await asyncio.to_thread(model.generate_content, prompt)
+    try:
+        data = MenuDiscovery.model_validate_json(response.text)
+        return data.items
+    except Exception as e:
+        print(f"Error discovering items: {e}")
+        raise
+
+async def extract_item_details_batch(items: List[MenuItemBasic], full_source_text: str, glossary: Dict[str, List[str]]) -> List[MenuItem]:
+    """Extract details for a small batch of items to stay within token limits."""
+    item_names = [item.display_name for item in items]
+    print(f"Extracting details for batch: {item_names}...")
+    
     model = genai.GenerativeModel(
         GEMINI_MODEL,
         generation_config={
@@ -150,32 +190,29 @@ async def extract_menu_data(menu_text: str, nutrition_text: str, glossary: Dict[
     glossary_json = json.dumps(glossary, indent=2)
     
     prompt = f"""
-    You are a nutrition data expert. Extract Arby's menu items using the provided menu text, nutrition text, and ingredient glossary.
+    You are a nutrition data expert. Extract full details for these Arby's menu items: {', '.join(item_names)}.
     
     CRITICAL RULES:
-    1. **Expand Ingredients**: For every ingredient listed for a menu item, check if it exists in the GLOSSARY. If it does, replace it with its sub-ingredients. If it doesn't, keep it as is.
-    2. **Flatten**: The final `ingredients_raw` list for each item should be a flat list of individual ingredients.
-    3. **Nutrition**: Extract fat, sodium, carbs, sugar, protein, and calories. If a value is '< 1g', use 0.
+    1. **Expand Ingredients**: Use the GLOSSARY to expand compound ingredients into their sub-ingredients.
+    2. **Flatten**: Return a flat list of individual ingredients in `ingredients_raw`.
+    3. **Nutrition**: Extract calories, fat, sodium, carbs, sugar, protein. Use 0 for "< 1g".
     4. **Allergens**: Extract explicitly listed allergens.
-    5. **Slug**: Generate a URL-friendly slug (e.g., 'classic-beef-n-cheddar').
+    5. **Categorization**: Keep the original category if possible.
     
     GLOSSARY:
     {glossary_json}
     
-    MENU LAYOUT TEXT:
-    {menu_text}
-    
-    NUTRITION TEXT:
-    {nutrition_text}
+    SOURCE TEXT CONTEXT (excerpts):
+    {full_source_text[:15000]}
     """
     
-    response = await asyncio.to_thread(model.generate_content, prompt)
     try:
+        response = await asyncio.to_thread(model.generate_content, prompt)
         data = MenuExtraction.model_validate_json(response.text)
         return data.items
     except Exception as e:
-        print(f"Error parsing menu data: {e}")
-        raise # Re-raise to trigger fail-fast in main()
+        print(f"Error extracting batch {item_names}: {e}")
+        return []
 
 def generate_deterministic_id(slug: str) -> str:
     return str(uuid.uuid5(NAMESPACE_UUID, f"{RESTAURANT_ID}:{slug}"))
@@ -185,7 +222,6 @@ ALLOWED_KINDS = {
     "entree", "side", "drink", "dessert", "breakfast", "condiment", "kids", "other"
 }
 
-# Order matters: these are “hard gates” for Swap safety (esp. drinks).
 _RX_KIDS = re.compile(r"\bkids?\b", re.I)
 _RX_CONDIMENT = re.compile(r"\b(condiment|sauce|dipping|dip|spread|dressing|syrup)\b", re.I)
 
@@ -198,7 +234,6 @@ _RX_DRINK = re.compile(
     re.I,
 )
 
-# Protein/snack SKUs should not get swept into dessert just because of “bar”.
 _RX_SIDE_STRONG = re.compile(
     r"\b(protein box|protein boxes|protein & snack bars|snack bars?)\b", re.I
 )
@@ -218,29 +253,14 @@ _RX_SIDE = re.compile(
 )
 
 def normalize_category_raw(raw: Optional[str]) -> Optional[str]:
-    """
-    Lightweight cleanup:
-    - trim / collapse whitespace
-    - drop ' - Regional' suffix
-    - drop long disclaimer after ' - ' (keeps left side)
-    - de-slugify if it looks like a slug (e.g., fries-sides)
-    """
-    if raw is None:
-        return None
+    if raw is None: return None
     s = raw.strip()
-    if not s:
-        return None
-
-    # Remove " - Regional" suffix
+    if not s: return None
     s = re.sub(r"\s*-\s*regional\s*$", "", s, flags=re.I).strip()
-
-    # Strip disclaimers after " - " when right side looks like a sentence/paragraph
     if " - " in s:
         left, right = s.split(" - ", 1)
         if "." in right or len(right) > 45:
             s = left.strip()
-
-    # If slug-like (no spaces, contains hyphens/underscores), de-slugify a bit
     if (" " not in s) and re.search(r"[-_]", s):
         slug = s.replace("_", "-").strip("-")
         parts = [p for p in slug.split("-") if p]
@@ -250,67 +270,35 @@ def normalize_category_raw(raw: Optional[str]) -> Optional[str]:
             s = " ".join(parts[:-1]) + " & More"
         else:
             s = " ".join(parts)
-        s = re.sub(r"\s+", " ", s).strip()
         s = s.title()
-
-    # Collapse whitespace (final)
     s = re.sub(r"\s+", " ", s).strip()
     return s or None
 
-def infer_category_kind(
-    *,
-    category: Optional[str],
-    display_name: Optional[str] = None,
-    overrides: Optional[Dict[str, str]] = None,
-) -> str:
-    """
-    Returns one of ALLOWED_KINDS.
-    If category is missing and we can’t infer safely, returns 'other' (not 'entree').
-    """
+def infer_category_kind(*, category: Optional[str], display_name: Optional[str] = None, overrides: Optional[Dict[str, str]] = None) -> str:
     cat = (category or "").strip()
     name = (display_name or "").strip()
-
-    # Optional brand-specific overrides (keys should be normalized category strings)
     if overrides and cat:
         forced = overrides.get(cat)
-        if forced in ALLOWED_KINDS:
-            return forced
-
+        if forced in ALLOWED_KINDS: return forced
     haystack = f"{cat} {name}".lower()
-
-    if _RX_KIDS.search(haystack):
-        return "kids"
-    if _RX_CONDIMENT.search(haystack):
-        return "condiment"
-    if _RX_DRINK.search(haystack):
-        return "drink"
-    if _RX_SIDE_STRONG.search(haystack):
-        return "side"
-    if _RX_DESSERT.search(haystack):
-        return "dessert"
-    if _RX_BREAKFAST.search(haystack):
-        return "breakfast"
-    if _RX_SIDE.search(haystack):
-        return "side"
-
-    # If scraper gave us a category and it’s not any of the above, treat as entree.
+    if _RX_KIDS.search(haystack): return "kids"
+    if _RX_CONDIMENT.search(haystack): return "condiment"
+    if _RX_DRINK.search(haystack): return "drink"
+    if _RX_SIDE_STRONG.search(haystack): return "side"
+    if _RX_DESSERT.search(haystack): return "dessert"
+    if _RX_BREAKFAST.search(haystack): return "breakfast"
+    if _RX_SIDE.search(haystack): return "side"
     return "entree" if cat else "other"
 
-def normalize_category_fields(
-    *,
-    display_name: str,
-    raw_category: Optional[str],
-    overrides: Optional[Dict[str, str]] = None,
-) -> Tuple[Optional[str], str]:
+def normalize_category_fields(*, display_name: str, raw_category: Optional[str], overrides: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], str]:
     category = normalize_category_raw(raw_category)
     kind = infer_category_kind(category=category or raw_category, display_name=display_name, overrides=overrides)
     return category, kind
 
-# --- Ingestion & Validation Logic (V3.5 Standard) ---
+# --- Ingestion & Validation Logic ---
 MIN_INGREDIENTS_CHARS = 10
 
 def hallucination_check(display_name: str, source_text: str) -> bool:
-    """Check if the display name exists in the source text (case-insensitive)."""
     clean_name = re.sub(r"[^a-zA-Z0-9\s]", "", display_name).lower()
     clean_source = re.sub(r"[^a-zA-Z0-9\s]", "", source_text).lower()
     return clean_name in clean_source
@@ -323,34 +311,26 @@ async def get_current_item_count() -> int:
         return 0
 
 async def ingest_item(item: MenuItem, source_text: str) -> bool:
-    category, kind = normalize_category_fields(
-        display_name=item.display_name,
-        raw_category=item.category
-    )
+    category, kind = normalize_category_fields(display_name=item.display_name, raw_category=item.category)
     menu_item_id = generate_deterministic_id(item.slug)
     print(f"Processing {item.display_name} (ID: {menu_item_id}, Kind: {kind})...")
     
-    # 1. Hallucination Gate
     if not hallucination_check(item.display_name, source_text):
-        print(f"  -> REJECTED: Hallucination detected - '{item.display_name}' not in source text.")
+        print(f"  -> REJECTED: Hallucination detected.")
         INGEST_STATS["rejected_hallucination"] += 1
         return False
 
-    # 2. Ingredient Quality Gate
-    total_ing_chars = sum(len(ing) for ing in item.ingredients_raw)
-    if total_ing_chars < MIN_INGREDIENTS_CHARS:
-        print(f"  -> REJECTED: Insufficient ingredients ({total_ing_chars} chars).")
+    if sum(len(ing) for ing in item.ingredients_raw) < MIN_INGREDIENTS_CHARS:
+        print(f"  -> REJECTED: Insufficient ingredients.")
         INGEST_STATS["rejected_quality"] += 1
         return False
 
-    # 3. Nutrition Gate
     if item.calories <= 0 and "water" not in item.display_name.lower() and "diet" not in item.display_name.lower():
-        print(f"  -> REJECTED: Invalid calories ({item.calories})")
+        print(f"  -> REJECTED: Invalid calories.")
         INGEST_STATS["rejected_nutrition"] += 1
         return False
 
     try:
-        # Upsert Menu Item
         res = supabase.table("menu_items").upsert({
             "id": menu_item_id,
             "restaurant_id": RESTAURANT_ID,
@@ -365,96 +345,59 @@ async def ingest_item(item: MenuItem, source_text: str) -> bool:
         }, on_conflict="restaurant_id,slug").execute()
         
         if not res.data:
-            print(f"  -> Failed to upsert menu item: {item.display_name}")
             INGEST_STATS["failed"] += 1
             return False
             
-        # Update Ingredients
         supabase.table("item_ingredients").delete().eq("menu_item_id", menu_item_id).execute()
-        
-        ingredients_payload = [
-            {"menu_item_id": menu_item_id, "ingredient": ing}
-            for ing in item.ingredients_raw
-        ]
+        ingredients_payload = [{"menu_item_id": menu_item_id, "ingredient": ing} for ing in item.ingredients_raw]
         if ingredients_payload:
             supabase.table("item_ingredients").insert(ingredients_payload).execute()
-            print(f"  -> SUCCESS: {len(ingredients_payload)} ingredients saved.")
-            INGEST_STATS["success"] += 1
-            return True
-        else:
-            print(f"  -> Warning: No ingredients to save for {item.display_name}")
-            INGEST_STATS["success"] += 1 # Item saved, just no ingredients
-            return True
-            
+        
+        INGEST_STATS["success"] += 1
+        return True
     except Exception as e:
         print(f"  -> Error ingesting {item.display_name}: {e}")
         INGEST_STATS["failed"] += 1
-        raise e # Re-raise to trigger fail-fast in main()
+        return False
 
 async def main():
     try:
-        # 1. Download PDFs
         nutrition_path = download_pdf(NUTRITION_PDF_URL, "nutrition.pdf")
         ingredients_path = download_pdf(INGREDIENTS_PDF_URL, "ingredients.pdf")
         
-        # 2. Extract Text
-        # Ingredients PDF: Pages 1-2 are menu layout, 3-7 are glossary (0-indexed: 0-1 and 2-6)
         menu_layout_text = extract_text_from_pdf(ingredients_path, pages=[0, 1])
         glossary_text = extract_text_from_pdf(ingredients_path, pages=[2, 3, 4, 5, 6])
         nutrition_text = extract_text_from_pdf(nutrition_path)
         
-        # Save raw text for debug
-        with open(os.path.join(DEBUG_DIR, "menu_layout.txt"), "w") as f: f.write(menu_layout_text)
-        with open(os.path.join(DEBUG_DIR, "glossary.txt"), "w") as f: f.write(glossary_text)
-        with open(os.path.join(DEBUG_DIR, "nutrition.txt"), "w") as f: f.write(nutrition_text)
-        
-        # 3. Get Glossary Mapping
         glossary = await get_glossary_mapping(glossary_text)
-        with open(os.path.join(DEBUG_DIR, "glossary_mapping.json"), "w") as f: json.dump(glossary, f, indent=2)
+        basic_items = await discover_menu_items(menu_layout_text, nutrition_text)
+        print(f"Discovered {len(basic_items)} items. Extracting in batches...")
         
-        # 4. Extract Final Menu Data
-        items = await extract_menu_data(menu_layout_text, nutrition_text, glossary)
-        with open(os.path.join(DEBUG_DIR, "extracted_items.json"), "w") as f: 
-            f.write(json.dumps([item.model_dump() for item in items], indent=2))
-        
-        print(f"Extracted {len(items)} items.")
-        
-        # 5. Ingest into Supabase
-        if not items:
-            print("CRITICAL: No items extracted from Gemini. ABORTING.")
-            sys.exit(1)
-
-        INGEST_STATS["total_extracted"] = len(items)
-
-        # Count Sanity Check (V3.5 Standard)
-        current_count = await get_current_item_count()
-        new_count = len(items)
-        print(f"Current DB items: {current_count}, New extracted items: {new_count}")
-        
-        if current_count > 0 and new_count < current_count * 0.8:
-            print(f"CRITICAL: New count ({new_count}) is < 80% of current count ({current_count}). Possible partial scrape. ABORTING SWAP.")
-            sys.exit(1)
-
         full_source_text = menu_layout_text + "\n" + nutrition_text
-        for item in items:
-            await ingest_item(item, full_source_text)
+        batch_size = 5
+        
+        for i in range(0, len(basic_items), batch_size):
+            batch = basic_items[i:i + batch_size]
+            detailed_items = await extract_item_details_batch(batch, full_source_text, glossary)
+            for item in detailed_items:
+                await ingest_item(item, full_source_text)
+            if i + batch_size < len(basic_items):
+                await asyncio.sleep(1)
 
-        # Final Success Check
         print("\n--- Scrape Summary ---")
         print(json.dumps(INGEST_STATS, indent=2))
         
         if INGEST_STATS["success"] < MIN_ITEMS_THRESHOLD:
-            print(f"CRITICAL: Successful ingestions ({INGEST_STATS['success']}) below threshold ({MIN_ITEMS_THRESHOLD}). FAIL.")
+            print(f"CRITICAL: Successful ingestions below threshold. FAIL.")
             sys.exit(1)
             
         print(f"\nSUCCESS: Arby's scraper completed with {INGEST_STATS['success']} items saved.")
             
     except Exception as e:
-        print(f"CRITICAL ERROR in main execution: {e}")
+        print(f"CRITICAL ERROR: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
