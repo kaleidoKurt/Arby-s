@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import pdfplumber
 import json
@@ -61,8 +62,12 @@ class MenuItem(BaseModel):
 class MenuExtraction(BaseModel):
     items: List[MenuItem]
 
+class GlossaryEntry(BaseModel):
+    compound_ingredient: str = Field(description="Name of the compound ingredient, e.g. 'Onion Roll'")
+    sub_ingredients: List[str] = Field(description="List of individual sub-ingredients")
+
 class GlossaryMapping(BaseModel):
-    glossary: Dict[str, List[str]] = Field(description="Mapping of compound ingredient names to their sub-ingredients")
+    entries: List[GlossaryEntry] = Field(description="List of compound ingredients and their sub-ingredients")
 
 def download_pdf(url: str, filename: str) -> str:
     path = os.path.join(DATA_DIR, filename)
@@ -104,7 +109,7 @@ async def get_glossary_mapping(glossary_text: str) -> Dict[str, List[str]]:
     
     Rules:
     - The glossary entries usually start with the name of the ingredient followed by its components.
-    - Return a flat mapping of 'Ingredient Name' to a list of its sub-ingredients.
+    - Extract each compound ingredient and its list of sub-ingredients.
     - Flatten any nested lists if found.
     
     GLOSSARY TEXT:
@@ -114,10 +119,11 @@ async def get_glossary_mapping(glossary_text: str) -> Dict[str, List[str]]:
     response = await asyncio.to_thread(model.generate_content, prompt)
     try:
         data = GlossaryMapping.model_validate_json(response.text)
-        return data.glossary
+        # Convert list of objects to dict for easier lookup
+        return {entry.compound_ingredient: entry.sub_ingredients for entry in data.entries}
     except Exception as e:
         print(f"Error parsing glossary: {e}")
-        return {}
+        raise # Re-raise to trigger fail-fast in main()
 
 async def extract_menu_data(menu_text: str, nutrition_text: str, glossary: Dict[str, List[str]]) -> List[MenuItem]:
     print("Extracting menu data with Gemini...")
@@ -157,7 +163,7 @@ async def extract_menu_data(menu_text: str, nutrition_text: str, glossary: Dict[
         return data.items
     except Exception as e:
         print(f"Error parsing menu data: {e}")
-        return []
+        raise # Re-raise to trigger fail-fast in main()
 
 def generate_deterministic_id(slug: str) -> str:
     return str(uuid.uuid5(NAMESPACE_UUID, f"{RESTAURANT_ID}:{slug}"))
@@ -362,49 +368,56 @@ async def ingest_item(item: MenuItem, source_text: str):
         print(f"  -> Error ingesting {item.display_name}: {e}")
 
 async def main():
-    # 1. Download PDFs
-    nutrition_path = download_pdf(NUTRITION_PDF_URL, "nutrition.pdf")
-    ingredients_path = download_pdf(INGREDIENTS_PDF_URL, "ingredients.pdf")
-    
-    # 2. Extract Text
-    # Ingredients PDF: Pages 1-2 are menu layout, 3-7 are glossary (0-indexed: 0-1 and 2-6)
-    menu_layout_text = extract_text_from_pdf(ingredients_path, pages=[0, 1])
-    glossary_text = extract_text_from_pdf(ingredients_path, pages=[2, 3, 4, 5, 6])
-    nutrition_text = extract_text_from_pdf(nutrition_path)
-    
-    # Save raw text for debug
-    with open(os.path.join(DEBUG_DIR, "menu_layout.txt"), "w") as f: f.write(menu_layout_text)
-    with open(os.path.join(DEBUG_DIR, "glossary.txt"), "w") as f: f.write(glossary_text)
-    with open(os.path.join(DEBUG_DIR, "nutrition.txt"), "w") as f: f.write(nutrition_text)
-    
-    # 3. Get Glossary Mapping
-    glossary = await get_glossary_mapping(glossary_text)
-    with open(os.path.join(DEBUG_DIR, "glossary_mapping.json"), "w") as f: json.dump(glossary, f, indent=2)
-    
-    # 4. Extract Final Menu Data
-    items = await extract_menu_data(menu_layout_text, nutrition_text, glossary)
-    with open(os.path.join(DEBUG_DIR, "extracted_items.json"), "w") as f: 
-        f.write(json.dumps([item.model_dump() for item in items], indent=2))
-    
-    print(f"Extracted {len(items)} items.")
-    
-    # 5. Ingest into Supabase
-    if not items:
-        print("No items extracted. Aborting ingestion.")
-        return
+    try:
+        # 1. Download PDFs
+        nutrition_path = download_pdf(NUTRITION_PDF_URL, "nutrition.pdf")
+        ingredients_path = download_pdf(INGREDIENTS_PDF_URL, "ingredients.pdf")
+        
+        # 2. Extract Text
+        # Ingredients PDF: Pages 1-2 are menu layout, 3-7 are glossary (0-indexed: 0-1 and 2-6)
+        menu_layout_text = extract_text_from_pdf(ingredients_path, pages=[0, 1])
+        glossary_text = extract_text_from_pdf(ingredients_path, pages=[2, 3, 4, 5, 6])
+        nutrition_text = extract_text_from_pdf(nutrition_path)
+        
+        # Save raw text for debug
+        with open(os.path.join(DEBUG_DIR, "menu_layout.txt"), "w") as f: f.write(menu_layout_text)
+        with open(os.path.join(DEBUG_DIR, "glossary.txt"), "w") as f: f.write(glossary_text)
+        with open(os.path.join(DEBUG_DIR, "nutrition.txt"), "w") as f: f.write(nutrition_text)
+        
+        # 3. Get Glossary Mapping
+        glossary = await get_glossary_mapping(glossary_text)
+        with open(os.path.join(DEBUG_DIR, "glossary_mapping.json"), "w") as f: json.dump(glossary, f, indent=2)
+        
+        # 4. Extract Final Menu Data
+        items = await extract_menu_data(menu_layout_text, nutrition_text, glossary)
+        with open(os.path.join(DEBUG_DIR, "extracted_items.json"), "w") as f: 
+            f.write(json.dumps([item.model_dump() for item in items], indent=2))
+        
+        print(f"Extracted {len(items)} items.")
+        
+        # 5. Ingest into Supabase
+        if not items:
+            print("No items extracted. Aborting ingestion.")
+            return
 
-    # Count Sanity Check (V3.5 Standard)
-    current_count = await get_current_item_count()
-    new_count = len(items)
-    print(f"Current DB items: {current_count}, New extracted items: {new_count}")
-    
-    if current_count > 0 and new_count < current_count * 0.8:
-        print(f"CRITICAL: New count ({new_count}) is < 80% of current count ({current_count}). Possible partial scrape. ABORTING SWAP.")
-        return
+        # Count Sanity Check (V3.5 Standard)
+        current_count = await get_current_item_count()
+        new_count = len(items)
+        print(f"Current DB items: {current_count}, New extracted items: {new_count}")
+        
+        if current_count > 0 and new_count < current_count * 0.8:
+            print(f"CRITICAL: New count ({new_count}) is < 80% of current count ({current_count}). Possible partial scrape. ABORTING SWAP.")
+            sys.exit(1)
 
-    full_source_text = menu_layout_text + "\n" + nutrition_text
-    for item in items:
-        await ingest_item(item, full_source_text)
+        full_source_text = menu_layout_text + "\n" + nutrition_text
+        for item in items:
+            await ingest_item(item, full_source_text)
+            
+    except Exception as e:
+        print(f"CRITICAL ERROR in main execution: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
