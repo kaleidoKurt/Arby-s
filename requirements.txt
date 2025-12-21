@@ -1,0 +1,8 @@
+pdfplumber
+google-generativeai
+supabase
+pydantic
+python-dotenv
+requests
+asyncio
+
