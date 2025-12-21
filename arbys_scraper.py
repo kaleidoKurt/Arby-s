@@ -17,6 +17,7 @@ load_dotenv()
 
 # Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 RESTAURANT_NAME = "Arby's"
@@ -96,7 +97,7 @@ def extract_text_from_pdf(path: str, pages: Optional[List[int]] = None) -> str:
 async def get_glossary_mapping(glossary_text: str) -> Dict[str, List[str]]:
     print("Parsing glossary mapping with Gemini...")
     model = genai.GenerativeModel(
-        "gemini-1.5-flash",
+        GEMINI_MODEL,
         generation_config={
             "response_mime_type": "application/json",
             "response_schema": GlossaryMapping,
@@ -128,7 +129,7 @@ async def get_glossary_mapping(glossary_text: str) -> Dict[str, List[str]]:
 async def extract_menu_data(menu_text: str, nutrition_text: str, glossary: Dict[str, List[str]]) -> List[MenuItem]:
     print("Extracting menu data with Gemini...")
     model = genai.GenerativeModel(
-        "gemini-1.5-flash",
+        GEMINI_MODEL,
         generation_config={
             "response_mime_type": "application/json",
             "response_schema": MenuExtraction,
