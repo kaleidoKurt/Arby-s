@@ -218,83 +218,17 @@ async def extract_item_details_batch(items: List[MenuItemBasic], full_source_tex
 def generate_deterministic_id(slug: str) -> str:
     return str(uuid.uuid5(NAMESPACE_UUID, f"{RESTAURANT_ID}:{slug}"))
 
-# --- Category Normalization (V3.5 Standard) ---
-ALLOWED_KINDS = {
-    "entree", "side", "drink", "dessert", "breakfast", "condiment", "kids", "other"
-}
-
-_RX_KIDS = re.compile(r"\bkids?\b", re.I)
-_RX_CONDIMENT = re.compile(r"\b(condiment|sauce|dipping|dip|spread|dressing|syrup|ketchup|mayo|mustard|packet|pepper|packet)\b", re.I)
-
-_RX_DRINK = re.compile(
-    r"\b("
-    r"coffee|latte|cappuccino|macchiato|espresso|americano|cortado|flat white|"
-    r"cold brew|nitro|frappuccino|tea|matcha|lemonade|refresher|"
-    r"smoothie|shake|milk|steamer|energy|punch|soda|coolatta|juice|water"
-    r")\b",
-    re.I,
-)
-
-_RX_SIDE_STRONG = re.compile(
-    r"\b(protein box|protein boxes|protein & snack bars|snack bars?)\b", re.I
-)
-
-_RX_DESSERT = re.compile(
-    r"\b(donut|munchkin|cookie|brownie|cake|cupcake|muffin|loaf|pie|frosty|ice cream|dessert|sweet)\b",
-    re.I,
-)
-
-_RX_BREAKFAST = re.compile(
-    r"\b(breakfast|bagel|omelet|pancake|waffle|crepe|biscuit|croissant|danish|egg bites?)\b",
-    re.I,
-)
-
-_RX_SIDE = re.compile(
-    r"\b(side|fries|chips|nuts|hash browns?|snack|salty)\b", re.I
-)
-
-def normalize_category_raw(raw: Optional[str]) -> Optional[str]:
-    if raw is None: return None
-    s = raw.strip()
-    if not s: return None
-    s = re.sub(r"\s*-\s*regional\s*$", "", s, flags=re.I).strip()
-    if " - " in s:
-        left, right = s.split(" - ", 1)
-        if "." in right or len(right) > 45:
-            s = left.strip()
-    if (" " not in s) and re.search(r"[-_]", s):
-        slug = s.replace("_", "-").strip("-")
-        parts = [p for p in slug.split("-") if p]
-        if len(parts) == 2:
-            s = f"{parts[0]} & {parts[1]}"
-        elif len(parts) >= 2 and parts[-1].lower() == "more":
-            s = " ".join(parts[:-1]) + " & More"
-        else:
-            s = " ".join(parts)
-        s = s.title()
-    s = re.sub(r"\s+", " ", s).strip()
-    return s or None
-
-def infer_category_kind(*, category: Optional[str], display_name: Optional[str] = None, overrides: Optional[Dict[str, str]] = None) -> str:
-    cat = (category or "").strip()
-    name = (display_name or "").strip()
-    if overrides and cat:
-        forced = overrides.get(cat)
-        if forced in ALLOWED_KINDS: return forced
-    haystack = f"{cat} {name}".lower()
-    if _RX_KIDS.search(haystack): return "kids"
-    if _RX_CONDIMENT.search(haystack): return "condiment"
-    if _RX_DRINK.search(haystack): return "drink"
-    if _RX_SIDE_STRONG.search(haystack): return "side"
-    if _RX_DESSERT.search(haystack): return "dessert"
-    if _RX_BREAKFAST.search(haystack): return "breakfast"
-    if _RX_SIDE.search(haystack): return "side"
-    return "entree" if cat else "other"
-
-def normalize_category_fields(*, display_name: str, raw_category: Optional[str], overrides: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], str]:
-    category = normalize_category_raw(raw_category)
-    kind = infer_category_kind(category=category or raw_category, display_name=display_name, overrides=overrides)
-    return category, kind
+# --- Category Normalization (Standardized) ---
+import sys
+from pathlib import Path
+# Import shared normalization logic from root
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+try:
+    from shared_utils import normalize_category_fields
+except ImportError:
+    print("⚠️  shared_utils.py not found in root. Using local limited fallback.")
+    def normalize_category_fields(display_name, raw_category, overrides=None):
+        return raw_category, "other"
 
 # --- Ingestion & Validation Logic ---
 MIN_INGREDIENTS_CHARS = 10
